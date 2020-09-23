@@ -585,6 +585,8 @@ static inline bool ufshcd_is_valid_pm_lvl(int lvl)
 
 static struct ufs_dev_fix ufs_fixups[] = {
 	/* UFS cards deviations table */
+	UFS_FIX(UFS_VENDOR_MICRON, UFS_ANY_MODEL,
+		UFS_DEVICE_QUIRK_DELAY_BEFORE_LPM),
 	UFS_FIX(UFS_VENDOR_SAMSUNG, UFS_ANY_MODEL,
 		UFS_DEVICE_QUIRK_DELAY_BEFORE_LPM),
 	UFS_FIX(UFS_VENDOR_SAMSUNG, UFS_ANY_MODEL,
@@ -1068,19 +1070,6 @@ static void ufshcd_print_clk_freqs(struct ufs_hba *hba)
 			dev_err(hba->dev, "clk: %s, rate: %u\n",
 					clki->name, clki->curr_freq);
 	}
-}
-
-void ufshcd_print_phy_state(struct ufs_hba *hba)
-{
-	if (!(hba->ufshcd_dbg_print & UFSHCD_DBG_PRINT_UIC_ERR_HIST_EN))
-		return;
-
-	ufs_qcom_print_phy_state(hba);
-}
-
-bool ufshcd_check_phy_state(struct ufs_hba *hba)
-{
-	return ufs_qcom_check_phy_state(hba);
 }
 
 static void ufshcd_print_uic_err_hist(struct ufs_hba *hba,
@@ -2400,6 +2389,7 @@ unblock_reqs:
 int ufshcd_hold(struct ufs_hba *hba, bool async)
 {
 	int rc = 0;
+	bool flush_result;
 	unsigned long flags;
 
 	if (!ufshcd_is_clkgating_allowed(hba))
@@ -2432,7 +2422,9 @@ start:
 			}
 
 			spin_unlock_irqrestore(hba->host->host_lock, flags);
-			flush_work(&hba->clk_gating.ungate_work);
+			flush_result = flush_work(&hba->clk_gating.ungate_work);
+			if (hba->clk_gating.is_suspended && !flush_result)
+				goto out;
 			spin_lock_irqsave(hba->host->host_lock, flags);
 			if (hba->ufshcd_state == UFSHCD_STATE_OPERATIONAL)
 				goto start;
@@ -7179,7 +7171,6 @@ static int ufshcd_bkops_ctrl(struct ufs_hba *hba,
 		err = ufshcd_enable_auto_bkops(hba);
 	else
 		err = ufshcd_disable_auto_bkops(hba);
-	hba->urgent_bkops_lvl = curr_status;
 out:
 	return err;
 }
@@ -7400,19 +7391,7 @@ static void ufshcd_err_handler(struct work_struct *work)
 
 	hba = container_of(work, struct ufs_hba, eh_work);
 
-	if (hba->auto_h8_err) {
-		dev_err(hba->dev, "%s: Auto Hibern8 error saved_err 0x%x saved_uic_err 0x%x",
-			__func__, hba->saved_err, hba->saved_uic_err);
-		ufshcd_print_host_state(hba);
-		ufshcd_print_phy_state(hba);
-		ufshcd_print_pwr_info(hba);
-		ufshcd_print_host_regs(hba);
-		ufshcd_print_cmd_log(hba);
-	}
-
 	spin_lock_irqsave(hba->host->host_lock, flags);
-	ufshcd_custom_cmd_log(hba, "ErrorHandler-Enter");
-
 	if (hba->extcon) {
 		if (ufshcd_is_card_online(hba)) {
 			spin_unlock_irqrestore(hba->host->host_lock, flags);
@@ -7900,7 +7879,7 @@ static irqreturn_t ufshcd_sl_intr(struct ufs_hba *hba, u32 intr_status)
  */
 static irqreturn_t ufshcd_intr(int irq, void *__hba)
 {
-	u32 intr_status, enabled_intr_status;
+	u32 intr_status, enabled_intr_status = 0;
 	irqreturn_t retval = IRQ_NONE;
 	struct ufs_hba *hba = __hba;
 	int retries = hba->nutrs;
@@ -7915,7 +7894,7 @@ static irqreturn_t ufshcd_intr(int irq, void *__hba)
 	 * read, make sure we handle them by checking the interrupt status
 	 * again in a loop until we process all of the reqs before returning.
 	 */
-	do {
+	while (intr_status && retries--) {
 		enabled_intr_status =
 			intr_status & ufshcd_readl(hba, REG_INTERRUPT_ENABLE);
 		if (intr_status)
@@ -7924,7 +7903,7 @@ static irqreturn_t ufshcd_intr(int irq, void *__hba)
 			retval |= ufshcd_sl_intr(hba, enabled_intr_status);
 
 		intr_status = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
-	} while (intr_status && --retries);
+	}
 
 	if (retval == IRQ_NONE) {
 		dev_err(hba->dev, "%s: Unhandled interrupt 0x%08x\n",
@@ -8247,7 +8226,7 @@ static int ufshcd_abort(struct scsi_cmnd *cmd)
 			/* command completed already */
 			dev_err(hba->dev, "%s: cmd at tag %d successfully cleared from DB.\n",
 				__func__, tag);
-			goto out;
+			goto cleanup;
 		} else {
 			dev_err(hba->dev,
 				"%s: no response from device. tag = %d, err %d\n",
@@ -8281,6 +8260,7 @@ static int ufshcd_abort(struct scsi_cmnd *cmd)
 		goto out;
 	}
 
+cleanup:
 	scsi_dma_unmap(cmd);
 
 	spin_lock_irqsave(host->host_lock, flags);
