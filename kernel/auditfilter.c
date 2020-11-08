@@ -567,7 +567,6 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 				err = PTR_ERR(audit_mark);
 				goto exit_free;
 			}
-			entry->rule.buflen += f_val;
 			entry->rule.exe = audit_mark;
 			break;
 		default:
